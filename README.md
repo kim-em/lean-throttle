@@ -50,27 +50,10 @@ The service's user needs Python on `PATH` and a writable home/cache directory.
 Setting this up in an interactive shell does not change already-running services
 or agents; put the settings in their launch environment too.
 
-## Adapt to your project
+## Tune headroom
 
-There are no project-specific paths or imports. With elan, the wrapper uses the
-running Lake's toolchain, or elan's selected toolchain when invoked directly. It
-works across projects with different `lean-toolchain` files without editing them
-or their `lakefile`.
-
-For a custom Lean installation, put its `lean` on `PATH`, or explicitly select
-its actual compiler executable:
-
-```sh
-export LEAN_THROTTLE_REAL_LEAN=/path/to/toolchain/bin/lean
-```
-
-Use the matching `lake` from that toolchain. The optional compiler path must not
-point back to this wrapper or an elan shim. Direct `lean` commands are covered
-only if they invoke the wrapper (for example, `"$LEAN" Main.lean` or
-`lake env lean Main.lean`).
-
-The defaults require no tuning. If your deployment needs different headroom, edit
-the two constants at the top of `lean-throttle`:
+If your deployment needs different headroom, edit the two constants at the top of
+`lean-throttle`:
 
 | Constant | Default | Start Lean when… |
 | --- | --- | --- |
