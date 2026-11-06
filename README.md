@@ -60,9 +60,10 @@ If your deployment needs different headroom, edit the two constants at the top o
 | `CPU_LIMIT_PERCENT` | `90` | host CPU busy time is at most 90% |
 | `MEMORY_LIMIT_PERCENT` | `80` | effective memory usage is at most 80% |
 
-For unusually memory-hungry files, lower the memory threshold to leave more RAM
-free. Changes apply to newly launched builds; no user or agent instructions need
-to change.
+You can use [this measurement tool](https://gist.github.com/kim-em/c136e561b37a4bd843854eae8cb6ccc4)
+to run a clean build and choose a memory threshold that leaves room for the
+largest measured Lean invocation, plus a margin. Changes apply to newly launched
+builds.
 
 ## How it works
 
