@@ -66,10 +66,9 @@ to change.
 
 ## How it works
 
-Each invocation checks memory and recent CPU usage immediately. CPU counters are
-shared between invocations, so **there is no sleep to take a CPU sample**. The
-first invocation seeds that history and proceeds if memory permits. Only when a
-threshold is exceeded does the wrapper sleep for a random 1–5 seconds and retry.
+Each invocation checks memory and recent CPU usage. If either threshold is
+exceeded, the wrapper sleeps for a random 1–5 seconds and retries. Otherwise,
+it starts Lean immediately.
 
 Lake uses a cached toolchain overlay to route compiler calls through the wrapper;
 your installed toolchain stays untouched. Discovery probes skip throttling, and
