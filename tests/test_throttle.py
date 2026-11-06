@@ -19,6 +19,59 @@ loader.exec_module(gate)
 
 
 class ThrottleTests(unittest.TestCase):
+    def test_spare_capacity_never_sleeps_even_with_cold_cpu_history(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, XDG_CACHE_HOME=directory),
+            patch.object(gate, "cpu_sample", return_value=(100, 20)),
+            patch.object(gate, "memory", return_value=(100 * 1024**3, 90 * 1024**3)),
+            patch.object(gate.time, "sleep", side_effect=AssertionError("unconditional sleep")),
+        ):
+            gate.wait_for_capacity()
+            gate.wait_for_capacity()
+
+    def test_cpu_history_measures_across_invocations_and_reuses_recent_samples(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, XDG_CACHE_HOME=directory),
+            patch.object(gate.time, "monotonic", side_effect=[100, 100.5, 100.6, 101, 120]),
+            patch.object(gate, "cpu_sample", side_effect=[(100, 20), (200, 25), (210, 30), (300, 100), (400, 200)]),
+            patch.object(gate.time, "sleep", side_effect=AssertionError("CPU sampling slept")),
+        ):
+            self.assertEqual(gate.cpu_usage(), 0)  # Cold start seeds counters.
+            self.assertEqual(gate.cpu_usage(), 95)
+            self.assertEqual(gate.cpu_usage(), 95)  # No noisy near-zero interval.
+            self.assertEqual(gate.cpu_usage(), 25)
+            self.assertEqual(gate.cpu_usage(), 0)  # Stale baseline starts afresh.
+
+    def test_busy_cached_cpu_waits_then_resumes_after_pressure_clears(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, XDG_CACHE_HOME=directory),
+            patch.object(gate.time, "monotonic", side_effect=[100, 100.5, 103]),
+            patch.object(gate, "cpu_sample", side_effect=[(100, 20), (200, 25), (700, 525)]),
+            patch.object(gate, "memory", return_value=(100 * 1024**3, 90 * 1024**3)),
+            patch.object(gate.random, "uniform", return_value=2.5),
+            patch.object(gate.time, "sleep") as sleep,
+        ):
+            gate.cpu_usage()
+            gate.wait_for_capacity()
+            sleep.assert_called_once_with(2.5)
+
+    def test_bad_cpu_history_does_not_delay_or_fail_compilation(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, XDG_CACHE_HOME=directory),
+            patch.object(gate, "cpu_sample", return_value=(100, 20)),
+        ):
+            cache = Path(directory) / "lean-throttle/cpu.json"
+            cache.parent.mkdir()
+            for text in ('', '{', 'null', '[]', '{"at": "bad"}',
+                         '{"at": 0, "sample": null, "percent": 95}'):
+                cache.write_text(text)
+                self.assertEqual(gate.cpu_usage(), 0)
+
+
     def setUp(self):
         for name in ("SIGPIPE", "SIGXFSZ"):
             if number := getattr(signal, name, None):
@@ -27,15 +80,15 @@ class ThrottleTests(unittest.TestCase):
     def test_waits_for_cpu_and_memory_then_resumes_silently(self):
         # Busy CPU, then low memory, then enough capacity at both thresholds.
         with (
-            patch.object(gate, "cpu_sample", side_effect=[(0, 0), (100, 5), (200, 25), (300, 35)]),
+            patch.object(gate, "cpu_usage", side_effect=[95, 80, 90]),
             patch.object(gate, "memory", side_effect=[(100, 50), (100, 5), (100, 20)]),
-            patch.object(gate.random, "uniform", side_effect=[0.3, 2, 4]),
+            patch.object(gate.random, "uniform", side_effect=[2, 4]),
             patch.object(gate.time, "sleep") as sleep,
             contextlib.redirect_stdout(io.StringIO()) as stdout,
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
             gate.wait_for_capacity()
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [0.3, 2, 4])
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2, 4])
         self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
     def test_cpu_ignores_guest_ticks_and_counts_iowait_as_idle(self):

@@ -66,38 +66,18 @@ to change.
 
 ## How it works
 
-Before each compilation, the wrapper samples CPU activity over a random
-0.2–0.5-second interval and reads available memory. If either threshold is
-exceeded, it sleeps for a random 1–5 seconds and checks again, until both pass.
-Random waits spread out simultaneous starts across independent builds.
+Each invocation checks memory and recent CPU usage immediately. CPU counters are
+shared between invocations, so **there is no sleep to take a CPU sample**. The
+first invocation seeds that history and proceeds if memory permits. Only when a
+threshold is exceeded does the wrapper sleep for a random 1–5 seconds and retry.
 
-Memory comes from Linux's `MemAvailable`, further bounded by visible cgroup v2
-`memory.max` limits, including ancestors. Clean file cache counts as reclaimable;
-shared memory and dirty/writeback pages do not. `memory.high` is a soft reclaim
-threshold and does not redefine capacity. CPU usage comes from host `/proc/stat`
-counters, with idle and I/O wait excluded from busy time.
+Lake uses a cached toolchain overlay to route compiler calls through the wrapper;
+your installed toolchain stays untouched. Discovery probes skip throttling, and
+the wrapper stays silent for compatibility with `lake build --iofail`.
 
-Lake discovers its compiler through `lean --print-prefix` and then invokes
-`<prefix>/bin/lean`. To keep those invocations throttled, the wrapper creates a
-cached toolchain overlay: a copy of itself at `bin/lean`, symlinks to the original
-libraries and tools, and a saved path to the original compiler. Installed
-toolchains stay untouched. See [Lake's installation discovery source][lake-source].
-
-Discovery probes (`--print-prefix`, `--githash`, `--version`, `--help`,
-`--print-libdir`, and their short forms) skip the wait. Compilation stays silent,
-including while waiting, so `lake build --iofail` works. Once admitted, the wrapper
-replaces itself with the real compiler using `exec`, preserving arguments,
-exit status, and normal signal handling.
-
-This is cooperative admission control: it delays new compiler processes, and
-does not suspend or limit already-running ones. Several invocations can pass
-together, a single file can exceed available RAM, and sustained external load can
-keep a build waiting indefinitely. It reduces contention without guaranteeing an
-OOM-free build or enforcing a hard CPU/memory cap. Cgroup v1 memory limits,
-container-hidden ancestor limits, and per-container CPU quotas are not measured;
-CPU checks use the host's total activity. C compilation and linking are outside
-the throttle. If required Linux counters are unreadable, the wrapper reports an
-error instead of starting a compiler without checking capacity.
+This delays new compiler processes; it cannot cap running processes or guarantee
+against OOM. CPU checks cover the host; memory checks include visible cgroup v2
+limits. C compilation and linking are outside the throttle.
 
 ## Update or remove
 
