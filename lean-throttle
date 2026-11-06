@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Sleep before starting Lean when memory or CPU is busy. Linux, Python 3.10+."""
+
+import fcntl
+import hashlib
+import json
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+CPU_LIMIT_PERCENT = 90
+MEMORY_LIMIT_PERCENT = 80
+MARKER = ".lean-throttle.json"
+
+
+def memory():
+    """Host memory, bounded by visible cgroup v2 hard limits and clean cache."""
+    fields = {
+        k: int(v.split()[0]) * 1024
+        for k, v in (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    }
+    total, available = fields["MemTotal"], fields["MemAvailable"]
+    relative = next(
+        (line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::")), None
+    )
+    if relative is not None:
+        root = Path("/sys/fs/cgroup")
+        group = root / relative.lstrip("/")
+        while group.is_relative_to(root):
+            maximum = group / "memory.max"
+            if maximum.exists() and (value := maximum.read_text().strip()) != "max":
+                limit = int(value)
+                stats = dict(line.split() for line in (group / "memory.stat").read_text().splitlines())
+                reclaimable = max(
+                    0, int(stats["file"]) - int(stats.get("shmem", 0))
+                    - int(stats.get("file_dirty", 0)) - int(stats.get("file_writeback", 0)),
+                )
+                used = max(0, int((group / "memory.current").read_text()) - reclaimable)
+                total, available = min(total, limit), min(available, max(0, limit - used))
+            group = group.parent
+    if total <= 0:
+        raise ValueError("memory capacity is unavailable")
+    return total, min(total, available)
+
+
+def cpu_sample():
+    # guest/guest_nice are already included in user/nice. iowait counts as idle.
+    values = [int(v) for v in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
+    return sum(values), values[3] + values[4]
+
+
+def cpu_percent(before, after):
+    elapsed = after[0] - before[0]
+    if elapsed <= 0:
+        raise ValueError("CPU counters did not advance")
+    return max(0, min(100, 100 * (1 - (after[1] - before[1]) / elapsed)))
+
+
+def wait_for_capacity():
+    before = cpu_sample()
+    time.sleep(random.uniform(0.2, 0.5))
+    while True:
+        after = cpu_sample()
+        total, available = memory()
+        if cpu_percent(before, after) <= CPU_LIMIT_PERCENT and 100 * (1 - available / total) <= MEMORY_LIMIT_PERCENT:
+            return
+        before = after
+        time.sleep(random.uniform(1, 5))
+
+
+def unwrapped(binary):
+    """Follow our saved compiler paths, rejecting accidental wrapper recursion."""
+    binary = Path(binary).resolve()
+    seen = {Path(__file__).resolve()}
+    while True:
+        if binary in seen:
+            raise ValueError(f"compiler wrapper cycle: {binary}")
+        seen.add(binary)
+        with binary.open("rb") as stream:
+            header = stream.read(4096)
+        if not (header.startswith(b"#!") and b'MARKER = ".lean-throttle.json"' in header):
+            return binary
+        marker = binary.parent.parent / MARKER
+        binary = Path(json.loads(marker.read_text())["lean"]).resolve()
+
+
+def real_lean():
+    marker = Path(__file__).resolve().parent.parent / MARKER
+    if marker.is_file():
+        return unwrapped(json.loads(marker.read_text())["lean"])
+    if binary := os.environ.get("LEAN_THROTTLE_REAL_LEAN"):
+        return unwrapped(binary)
+    # Honor the running Lake's toolchain, including `elan +version` selections.
+    try:
+        parent = Path(f"/proc/{os.getppid()}/exe").resolve(strict=True)
+        if parent.name == "lake" and (parent.parent / "lean").is_file():
+            return unwrapped(parent.parent / "lean")
+    except OSError:
+        pass
+    if elan := shutil.which("elan"):
+        result = subprocess.run([elan, "which", "lean"], text=True, capture_output=True, check=True)
+        return unwrapped(result.stdout.strip())
+    if binary := shutil.which("lean"):
+        return unwrapped(binary)
+    raise ValueError("cannot find Lean; install elan or set LEAN_THROTTLE_REAL_LEAN to the compiler path")
+
+
+def overlay(lean):
+    """Lake runs <prefix>/bin/lean; return a prefix that keeps our wrapper there."""
+    source = Path(__file__).resolve()
+    info = lean.stat()
+    identity = f"{lean}:{info.st_ino}:{info.st_mtime_ns}"
+    key = hashlib.sha256(identity.encode() + source.read_bytes()).hexdigest()[:24]
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "lean-throttle"
+    target = base / key
+    if target.is_dir():
+        return target
+    base.mkdir(parents=True, exist_ok=True)
+    with (base / "setup.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not target.exists():
+            with tempfile.TemporaryDirectory(dir=base) as temporary:
+                work = Path(temporary) / "toolchain"
+                work.mkdir()
+                for path in lean.parent.parent.iterdir():
+                    if path.name not in {"bin", MARKER}:
+                        (work / path.name).symlink_to(path)
+                (work / "bin").mkdir()
+                for path in lean.parent.iterdir():
+                    if path.name != "lean":
+                        (work / "bin" / path.name).symlink_to(path)
+                # Keep existing builds independent of future script updates.
+                shutil.copyfile(source, work / "bin/lean")
+                (work / "bin/lean").chmod(0o755)
+                (work / MARKER).write_text(json.dumps(dict(lean=str(lean))))
+                work.rename(target)
+    return target
+
+
+def main(args):
+    try:
+        lean = real_lean()
+        if args == ["--print-prefix"]:
+            marker = Path(__file__).resolve().parent.parent / MARKER
+            print(marker.parent if marker.is_file() else overlay(lean))
+            return 0
+        # Lake's discovery probes must stay quick and successful builds silent
+        # (`lake build --iofail` treats compiler output as a failure).
+        if args not in (["--githash"], ["--version"], ["-v"], ["--help"], ["-h"], ["--print-libdir"]):
+            wait_for_capacity()
+        for name in ("SIGPIPE", "SIGXFSZ"):
+            if number := getattr(signal, name, None):
+                signal.signal(number, signal.SIG_DFL)
+        os.execv(str(lean), [str(lean), *args])
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as error:
+        print(f"lean-throttle: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
